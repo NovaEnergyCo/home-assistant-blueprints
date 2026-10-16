@@ -27,3 +27,7 @@ sin crear ayudantes nuevos. Cada carpeta explica cómo funciona su plano.
 Los estados y ayudantes siguen el formato de
 [Aula inteligente - Multi dispositivos](https://github.com/andersoncamero/blueprint_aulas) de andersoncamero,
 para que sean compatibles.
+
+## Licencia
+
+[MIT](LICENSE) © NovaEnergyCo
