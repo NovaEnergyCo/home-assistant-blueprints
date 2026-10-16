@@ -1,0 +1,509 @@
+blueprint:
+  name: Espacio inteligente - Movimiento y horario
+  description: >-
+    Para espacios SIN sensor de puerta. Arranca con el movimiento y sigue un horario:
+
+    - Hora de inicio (solo en día hábil según Workday): pasa a AUTOMÁTICO; si ya hay gente, enciende.
+
+    - En AUTOMÁTICO: con movimiento enciende luces y aire a la temperatura de ocupación.
+      Sin movimiento, tras el tiempo de scan apaga las luces y el aire se APAGA o se SUBE
+      a la temperatura de no ocupación (según "Al quedar libre").
+
+    - Hora de fin (todos los días): pasa a MANUAL y, si el espacio está vacío, apaga todo.
+
+    - En MANUAL nunca enciende: si alguien prendió a mano y se fue, tras el scan apaga todo.
+
+    Usa los mismos ayudantes y estados (LIBRE, OCUPADO, SCAN) que
+    "Aula inteligente - Multi dispositivos". El aire puede ser un termostato (climate)
+    y/o un contactor (switch de un control de carga CC).
+  domain: automation
+  author: NovaEnergyCo
+  source_url: https://github.com/NovaEnergyCo/home-assistant-blueprints/blob/main/espacio-movimiento-horario/espacio_movimiento_horario.yaml
+  homeassistant:
+    min_version: "2024.10.0"
+  input:
+    motion_sensors:
+      name: Sensores de Movimiento
+      description: "binary_sensor o switch (p. ej. el contacto seco CS de un sensor de 110 V). Encendido = hay movimiento."
+      selector:
+        entity:
+          domain:
+            - binary_sensor
+            - switch
+          multiple: true
+
+    modo_auto:
+      name: Modo Automático
+      description: "input_boolean. El horario lo enciende y lo apaga. ON = enciende y apaga; OFF = solo apaga."
+      selector:
+        entity:
+          domain: input_boolean
+
+    target_lights:
+      name: Iluminación (Opcional)
+      default: {}
+      selector:
+        target:
+          entity:
+            domain:
+              - light
+              - switch
+
+    target_climates:
+      name: Termostatos (Opcional)
+      default: {}
+      selector:
+        target:
+          entity:
+            domain: climate
+
+    ac_contactors:
+      name: Aire por contactor (Opcional)
+      description: "switch del control de carga (CC) que acciona el contactor del aire. Solo enciende o apaga."
+      default: {}
+      selector:
+        target:
+          entity:
+            domain: switch
+
+    classroom_status:
+      name: Estado del Espacio (Helper)
+      description: "input_select con las opciones LIBRE, OCUPADO, PUERTA_ABIERTA, SCAN (PUERTA_ABIERTA no se usa aquí)."
+      selector:
+        entity:
+          domain: input_select
+
+    workday:
+      name: Sensor Workday (Opcional)
+      description: "Si se indica, el horario solo pasa a automático en días hábiles. Vacío = todos los días."
+      default: ""
+      selector:
+        entity:
+          domain: binary_sensor
+
+    start_time:
+      name: Hora de inicio
+      default: "06:00:00"
+      selector:
+        time: {}
+
+    end_time:
+      name: Hora de fin
+      default: "14:00:00"
+      selector:
+        time: {}
+
+    modo_libre:
+      name: Al quedar libre (dentro del horario)
+      description: "Fuera del horario siempre se apaga."
+      default: apagar
+      selector:
+        select:
+          options:
+            - label: Apagar el aire
+              value: apagar
+            - label: Subir a la temperatura de no ocupación
+              value: subir
+
+    target_temperature:
+      name: Temperatura de ocupación
+      default: 23
+      selector:
+        number:
+          min: 16
+          max: 30
+          step: 0.5
+          unit_of_measurement: "°C"
+          mode: slider
+
+    temp_empty:
+      name: Temperatura de no ocupación
+      description: "Solo con 'Subir a la temperatura de no ocupación'."
+      default: 27
+      selector:
+        number:
+          min: 16
+          max: 30
+          step: 0.5
+          unit_of_measurement: "°C"
+          mode: slider
+
+    off_delay:
+      name: Tiempo de Scan
+      description: "Segundos sin movimiento antes de considerar el espacio libre."
+      default: 420
+      selector:
+        number:
+          min: 30
+          max: 1800
+          unit_of_measurement: seconds
+          mode: slider
+          step: 30
+
+    delay_off_device:
+      name: Espera entre el aire y las luces al apagar
+      default: 60
+      selector:
+        number:
+          min: 0
+          max: 300
+          unit_of_measurement: seconds
+          mode: slider
+
+    countdown_indicator:
+      name: Indicador de Cuenta Regresiva (Opcional)
+      default: ""
+      selector:
+        entity:
+          domain: input_number
+
+    previous_status_display:
+      name: Visualizador Estado Anterior (Opcional)
+      default: ""
+      selector:
+        entity:
+          domain: input_text
+
+# restart: si vuelve el movimiento durante el SCAN, se cancela la cuenta regresiva
+mode: restart
+max_exceeded: silent
+
+variables:
+  motion_sensors_list: !input motion_sensors
+  workday_entity: !input workday
+
+triggers:
+  - trigger: state
+    entity_id: !input motion_sensors
+    to: "on"
+    id: "movimiento"
+
+  - trigger: state
+    entity_id: !input motion_sensors
+    to: "off"
+    id: "sin_movimiento"
+
+  - trigger: state
+    entity_id: !input classroom_status
+    to: "LIBRE"
+    id: "libre_manual"
+
+  - trigger: time
+    at: !input start_time
+    id: "inicio"
+
+  - trigger: time
+    at: !input end_time
+    id: "fin"
+
+# Las condiciones se evalúan antes de reiniciar: un disparo descartado no cancela lo que esté en curso.
+conditions:
+  # "sin_movimiento" solo cuenta cuando TODOS los sensores están apagados
+  - condition: template
+    value_template: >-
+      {%- if trigger.id == 'sin_movimiento' -%}
+        {%- set lista = [motion_sensors_list] if motion_sensors_list is string else motion_sensors_list -%}
+        {{ lista | select('is_state', 'on') | list | count == 0 }}
+      {%- else -%}
+        true
+      {%- endif -%}
+  # "libre_manual" solo cuando lo elige una persona, no la propia automatización
+  - condition: template
+    value_template: >-
+      {{ trigger.id != 'libre_manual' or trigger.to_state.context.user_id is not none }}
+  # El inicio de jornada solo en días hábiles
+  - condition: template
+    value_template: >-
+      {{ trigger.id != 'inicio' or workday_entity in ['', none] or is_state(workday_entity, 'on') }}
+
+actions:
+  - variables:
+      climate_list: !input target_climates
+      lights_list: !input target_lights
+      contactors_list: !input ac_contactors
+      modo_auto: !input modo_auto
+      status_entity: !input classroom_status
+      countdown_entity: !input countdown_indicator
+      previous_status_entity: !input previous_status_display
+      scanning_time: !input off_delay
+      modo_libre: !input modo_libre
+      previous_status: "{{ states(status_entity) }}"
+      hay_clima: "{{ (climate_list.entity_id | default([])) | count > 0 }}"
+      hay_luces: "{{ (lights_list.entity_id | default([])) | count > 0 }}"
+      hay_contactor: "{{ (contactors_list.entity_id | default([])) | count > 0 }}"
+      hay_cuenta: "{{ countdown_entity != '' and countdown_entity is not none }}"
+      hay_anterior: "{{ previous_status_entity != '' and previous_status_entity is not none }}"
+      hay_movimiento: >-
+        {%- set lista = [motion_sensors_list] if motion_sensors_list is string else motion_sensors_list -%}
+        {{ lista | select('is_state', 'on') | list | count > 0 }}
+
+  - choose:
+      # ── Fin de jornada: pasa a manual; si está vacío, apaga lo que quede ──
+      - conditions:
+          - condition: trigger
+            id: "fin"
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: !input modo_auto
+          # Con gente adentro no se apaga: al irse, el scan apagará todo (ya en manual)
+          - condition: template
+            value_template: "{{ previous_status != 'OCUPADO' }}"
+          - &apagar_todo
+            alias: "Apagar aire y luces"
+            sequence:
+              - if:
+                  - condition: template
+                    value_template: "{{ hay_clima }}"
+                then:
+                  - action: climate.set_hvac_mode
+                    target: !input target_climates
+                    data:
+                      hvac_mode: "off"
+              - if:
+                  - condition: template
+                    value_template: "{{ hay_contactor }}"
+                then:
+                  - action: switch.turn_off
+                    target: !input ac_contactors
+              - if:
+                  - condition: template
+                    value_template: "{{ hay_luces }}"
+                then:
+                  - action: homeassistant.turn_off
+                    target: !input target_lights
+          - if:
+              - condition: template
+                value_template: "{{ hay_cuenta }}"
+            then:
+              - action: input_number.set_value
+                target:
+                  entity_id: "{{ countdown_entity }}"
+                data:
+                  value: 0
+          # Último paso (vuelve a disparar la automatización, pero "libre_manual" lo descarta)
+          - action: input_select.select_option
+            target:
+              entity_id: !input classroom_status
+            data:
+              option: "LIBRE"
+
+      # ── Inicio de jornada: pasa a automático; si ya hay gente, enciende ──
+      - conditions:
+          - condition: trigger
+            id: "inicio"
+        sequence:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: !input modo_auto
+          - if:
+              - condition: template
+                value_template: "{{ hay_movimiento }}"
+            then:
+              - &encender
+                alias: "Encender luces y aire"
+                sequence:
+                  - if:
+                      - condition: template
+                        value_template: "{{ hay_luces }}"
+                    then:
+                      - action: homeassistant.turn_on
+                        target: !input target_lights
+                  - if:
+                      - condition: template
+                        value_template: "{{ hay_clima }}"
+                    then:
+                      - action: climate.set_temperature
+                        target: !input target_climates
+                        data:
+                          temperature: !input target_temperature
+                          hvac_mode: "cool"
+                  - if:
+                      - condition: template
+                        value_template: "{{ hay_contactor }}"
+                    then:
+                      - action: switch.turn_on
+                        target: !input ac_contactors
+              - action: input_select.select_option
+                target:
+                  entity_id: !input classroom_status
+                data:
+                  option: "OCUPADO"
+            else:
+              # El inicio interrumpió un SCAN en curso (alguien se fue justo antes):
+              # se termina como lo habría hecho el scan, apagando todo.
+              - if:
+                  - condition: template
+                    value_template: "{{ previous_status == 'SCAN' }}"
+                then:
+                  - *apagar_todo
+                  - action: input_select.select_option
+                    target:
+                      entity_id: !input classroom_status
+                    data:
+                      option: "LIBRE"
+
+      # ── Hay movimiento: OCUPADO; en automático además enciende ──
+      - conditions:
+          - condition: trigger
+            id: "movimiento"
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ hay_cuenta }}"
+            then:
+              - action: input_number.set_value
+                target:
+                  entity_id: "{{ countdown_entity }}"
+                data:
+                  value: 0
+          - condition: template
+            value_template: "{{ previous_status != 'OCUPADO' }}"
+          - if:
+              - condition: template
+                value_template: "{{ is_state(modo_auto, 'on') }}"
+            then:
+              - *encender
+          - if:
+              - condition: template
+                value_template: "{{ hay_anterior }}"
+            then:
+              - action: input_text.set_value
+                target:
+                  entity_id: "{{ previous_status_entity }}"
+                data:
+                  value: "{{ previous_status }}"
+          - action: input_select.select_option
+            target:
+              entity_id: !input classroom_status
+            data:
+              option: "OCUPADO"
+
+      # ── Sin movimiento: SCAN con cuenta regresiva y, si nadie vuelve, apagar o subir ──
+      - conditions:
+          - condition: trigger
+            id: "sin_movimiento"
+          - condition: template
+            value_template: "{{ previous_status != 'LIBRE' }}"
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ hay_anterior }}"
+            then:
+              - action: input_text.set_value
+                target:
+                  entity_id: "{{ previous_status_entity }}"
+                data:
+                  value: "{{ previous_status }}"
+          - action: input_select.select_option
+            target:
+              entity_id: !input classroom_status
+            data:
+              option: "SCAN"
+          - if:
+              - condition: template
+                value_template: "{{ hay_cuenta }}"
+            then:
+              - action: input_number.set_value
+                target:
+                  entity_id: "{{ countdown_entity }}"
+                data:
+                  value: "{{ scanning_time }}"
+              - repeat:
+                  count: "{{ (scanning_time / 10) | int }}"
+                  sequence:
+                    - delay:
+                        seconds: 10
+                    - action: input_number.set_value
+                      target:
+                        entity_id: "{{ countdown_entity }}"
+                      data:
+                        value: "{{ [scanning_time - (repeat.index * 10), 0] | max }}"
+            else:
+              - delay:
+                  seconds: !input off_delay
+
+          # Llegar aquí significa que nadie volvió (si no, la automatización se habría reiniciado).
+          # El modo se lee AHORA: si el horario terminó durante el scan, ya es manual.
+          - if:
+              - condition: template
+                value_template: "{{ is_state(modo_auto, 'on') and modo_libre == 'subir' }}"
+            then:
+              # Subir la temperatura solo a los termostatos que sigan encendidos;
+              # un contactor no regula temperatura, así que se apaga.
+              - if:
+                  - condition: template
+                    value_template: "{{ hay_clima }}"
+                then:
+                  - repeat:
+                      for_each: >-
+                        {%- set ids = climate_list.entity_id -%}
+                        {{ ([ids] if ids is string else ids) | reject('is_state', 'off') | list }}
+                      sequence:
+                        - action: climate.set_temperature
+                          target:
+                            entity_id: "{{ repeat.item }}"
+                          data:
+                            temperature: !input temp_empty
+              - if:
+                  - condition: template
+                    value_template: "{{ hay_contactor }}"
+                then:
+                  - action: switch.turn_off
+                    target: !input ac_contactors
+            else:
+              - if:
+                  - condition: template
+                    value_template: "{{ hay_clima }}"
+                then:
+                  - action: climate.set_hvac_mode
+                    target: !input target_climates
+                    data:
+                      hvac_mode: "off"
+              - if:
+                  - condition: template
+                    value_template: "{{ hay_contactor }}"
+                then:
+                  - action: switch.turn_off
+                    target: !input ac_contactors
+
+          - if:
+              - condition: template
+                value_template: "{{ hay_luces }}"
+            then:
+              - delay:
+                  seconds: !input delay_off_device
+              - action: homeassistant.turn_off
+                target: !input target_lights
+
+          - if:
+              - condition: template
+                value_template: "{{ hay_anterior }}"
+            then:
+              - action: input_text.set_value
+                target:
+                  entity_id: "{{ previous_status_entity }}"
+                data:
+                  value: "SCAN"
+          # Último paso (vuelve a disparar la automatización, pero "libre_manual" lo descarta)
+          - action: input_select.select_option
+            target:
+              entity_id: !input classroom_status
+            data:
+              option: "LIBRE"
+
+      # ── Una persona eligió LIBRE a mano: apagar todo ──
+      - conditions:
+          - condition: trigger
+            id: "libre_manual"
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ hay_cuenta }}"
+            then:
+              - action: input_number.set_value
+                target:
+                  entity_id: "{{ countdown_entity }}"
+                data:
+                  value: 0
+          - *apagar_todo
