@@ -1,5 +1,7 @@
 # Aula inteligente – Puerta, movimiento y horario
 
+[![Importar en Home Assistant](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2FNovaEnergyCo%2Fhome-assistant-blueprints%2Fblob%2Fmain%2Faula-puerta-movimiento-horario%2Faula_puerta_horario.yaml)
+
 Blueprint de automatización de Home Assistant para **salones de clase con sensor de puerta y sensor de movimiento**. Controla el aire acondicionado y las luces según la puerta, el movimiento, el horario escolar y los días hábiles.
 
 Archivo: `aula_puerta_horario.yaml` · Autor: NovaEnergyCo · Requiere Home Assistant 2024.10 o superior.
