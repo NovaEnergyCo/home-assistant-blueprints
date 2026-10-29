@@ -1,16 +1,19 @@
 blueprint:
   name: Aula inteligente - Puerta, movimiento y horario
   description: >-
-    Para salones CON sensor de puerta. La puerta manda; el movimiento confirma si hay gente.
+    Versión 2.1. Para salones CON sensor de puerta. La puerta manda; el movimiento confirma si hay gente.
     Con horario y Workday:
 
-    - Se abre la puerta: si estaba LIBRE y en automático, enciende. Si la puerta queda abierta
-      el tiempo configurado, apaga primero el aire y después las luces, AUNQUE HAYA MOVIMIENTO
-      (la puerta debe permanecer cerrada). Queda en PUERTA_ABIERTA hasta que la cierren.
+    - Se abre la puerta: si estaba LIBRE y en automático, enciende (primero el aire y medio segundo
+      después las luces). Si estaba en SCAN con el aire ya apagado y las luces todavía encendidas,
+      también lo trata como una entrada. Si la puerta queda abierta el tiempo configurado, apaga primero
+      el aire y después las luces, AUNQUE HAYA MOVIMIENTO (la puerta debe permanecer cerrada). Queda en
+      PUERTA_ABIERTA hasta que la cierren.
 
-    - Se cierra la puerta: SCAN. Hay gente si el movimiento se activa durante el scan o si sigue
-      activo al terminarlo. Con gente: OCUPADO (y si el aire estaba apagado por la puerta, se
-      reanuda). Sin gente: el aire se APAGA o se SUBE (según "Al quedar libre") y las luces se apagan.
+    - Se cierra la puerta: SCAN. Hay gente si el movimiento se activa durante el scan, si sigue activo
+      al terminarlo o si alguien manipula un interruptor o un termostato. Con gente: OCUPADO (y si el
+      aire estaba apagado por la puerta, se reanuda). Sin gente: el aire se APAGA o se SUBE (según "Al
+      quedar libre"), el salón pasa a LIBRE y después se apagan las luces.
 
     - Movimiento estando LIBRE con la puerta cerrada (la puerta no registró la entrada): en
       automático enciende y confirma con el scan.
@@ -59,6 +62,20 @@ blueprint:
 
     target_lights:
       name: Iluminación (Opcional)
+      description: "Luces que se encienden con el salón y se apagan cuando queda libre."
+      default: {}
+      selector:
+        target:
+          entity:
+            domain:
+              - light
+              - switch
+
+    extra_off:
+      name: Apagar también al quedar libre (Opcional)
+      description: >-
+        Luces o cargas que NO se encienden con el salón, pero se apagan junto con las luces:
+        al quedar libre, al vencerse la puerta abierta, a la hora de fin y con LIBRE manual.
       default: {}
       selector:
         target:
@@ -83,6 +100,24 @@ blueprint:
         target:
           entity:
             domain: switch
+
+    manual_watch:
+      name: Actuadores que indican presencia (Opcional)
+      description: >-
+        Si durante el SCAN alguien prende o apaga uno de estos interruptores, o cambia el modo o la
+        temperatura de uno de estos termostatos, el salón pasa a OCUPADO de inmediato. Normalmente:
+        los canales de luz del salón, el botón AC y el termostato. Se ignoran los cambios que hacen
+        las automatizaciones y scripts.
+      default: []
+      selector:
+        entity:
+          multiple: true
+          filter:
+            - domain:
+                - switch
+                - light
+                - climate
+                - input_boolean
 
     classroom_status:
       name: Estado del Aula (Helper)
@@ -244,6 +279,18 @@ triggers:
       minutes: !input max_sin_movimiento
     id: "ocupado_sin_movimiento"
 
+  # Alguien prende/apaga un actuador o cambia el modo del termostato
+  - trigger: state
+    entity_id: !input manual_watch
+    to: null
+    id: "manipulacion"
+
+  # Alguien cambia la temperatura del termostato
+  - trigger: state
+    entity_id: !input manual_watch
+    attribute: temperature
+    id: "manipulacion"
+
   - trigger: state
     entity_id: !input classroom_status
     to: "LIBRE"
@@ -278,6 +325,23 @@ conditions:
       {%- else -%}
         true
       {%- endif -%}
+  # Manipulación: solo durante el SCAN, sin estados inválidos, y si no la hizo una automatización o un
+  # script (su cambio lleva el contexto de esa ejecución). Los 10 s después de un disparo de esta
+  # automatización se ignoran: son confirmaciones tardías de sus propios comandos Z-Wave.
+  - condition: template
+    value_template: >-
+      {%- if trigger.id == 'manipulacion' -%}
+        {%- set invalidos = ['unavailable', 'unknown'] -%}
+        {%- set ctx = trigger.to_state.context.id if trigger.to_state is not none else '' -%}
+        {{ is_state(status_entity_top, 'SCAN')
+           and trigger.from_state is not none and trigger.to_state is not none
+           and trigger.from_state.state not in invalidos and trigger.to_state.state not in invalidos
+           and states.automation | selectattr('context.id', 'eq', ctx) | list | count == 0
+           and states.script | selectattr('context.id', 'eq', ctx) | list | count == 0
+           and (this is not defined or as_timestamp(now()) - as_timestamp(this.attributes.last_triggered, 0) > 10) }}
+      {%- else -%}
+        true
+      {%- endif -%}
   # "libre_manual" cuando lo elige una persona o una escena, no esta misma automatización
   # (el cambio que hace ella lleva el contexto de su última ejecución)
   - condition: template
@@ -293,6 +357,7 @@ actions:
   - variables:
       climate_list: !input target_climates
       lights_list: !input target_lights
+      extra_list: !input extra_off
       contactors_list: !input ac_contactors
       modo_auto: !input modo_auto
       status_entity: !input classroom_status
@@ -305,12 +370,22 @@ actions:
       puerta_abierta: "{{ is_state(door_entity, 'on') }}"
       hay_clima: "{{ (climate_list.entity_id | default([])) | count > 0 }}"
       hay_luces: "{{ (lights_list.entity_id | default([])) | count > 0 }}"
+      hay_extra: "{{ (extra_list.entity_id | default([])) | count > 0 }}"
       hay_contactor: "{{ (contactors_list.entity_id | default([])) | count > 0 }}"
       hay_cuenta: "{{ countdown_entity != '' and countdown_entity is not none }}"
       hay_anterior: "{{ previous_status_entity != '' and previous_status_entity is not none }}"
       hay_movimiento: >-
         {%- set lista = [motion_sensors_list] if motion_sensors_list is string else motion_sensors_list -%}
         {{ lista | select('is_state', 'on') | list | count > 0 }}
+      # Aire (termostatos + contactores) todo apagado, y luces con alguna encendida
+      aire_apagado: >-
+        {%- set c = climate_list.entity_id | default([]) -%}
+        {%- set k = contactors_list.entity_id | default([]) -%}
+        {%- set aire = ([c] if c is string else c) + ([k] if k is string else k) -%}
+        {{ aire | count > 0 and aire | reject('is_state', 'off') | list | count == 0 }}
+      luces_encendidas: >-
+        {%- set l = lights_list.entity_id | default([]) -%}
+        {{ ([l] if l is string else l) | select('is_state', 'on') | list | count > 0 }}
 
   - choose:
       # ── Una persona o una escena eligió LIBRE: apagar todo ──
@@ -328,7 +403,7 @@ actions:
                 data:
                   value: 0
           - &apagar_todo
-            alias: "Apagar aire y luces"
+            alias: "Apagar aire, luces y cargas extra"
             sequence:
               - if:
                   - condition: template
@@ -350,33 +425,35 @@ actions:
                 then:
                   - action: homeassistant.turn_off
                     target: !input target_lights
+              - if:
+                  - condition: template
+                    value_template: "{{ hay_extra }}"
+                then:
+                  - action: homeassistant.turn_off
+                    target: !input extra_off
 
-      # ── Se abre la puerta: encender si estaba libre; si queda abierta, apagar aire y luego luces ──
+      # ── Se abre la puerta: encender si es una entrada; si queda abierta, apagar aire y luego luces ──
       - conditions:
           - condition: trigger
             id: "puerta_abre"
         sequence:
+          # Entrada: venía de LIBRE, o de un SCAN que ya apagó el aire y está por apagar las luces
           - if:
               - condition: template
-                value_template: "{{ previous_status == 'LIBRE' and is_state(modo_auto, 'on') }}"
+                value_template: >-
+                  {{ is_state(modo_auto, 'on') and (previous_status == 'LIBRE'
+                     or (previous_status == 'SCAN' and aire_apagado and luces_encendidas)) }}
             then:
               - &encender
-                alias: "Encender luces y aire"
+                alias: "Encender: aire, medio segundo después luces, y luego la temperatura"
                 sequence:
-                  - if:
-                      - condition: template
-                        value_template: "{{ hay_luces }}"
-                    then:
-                      - action: homeassistant.turn_on
-                        target: !input target_lights
                   - if:
                       - condition: template
                         value_template: "{{ hay_clima }}"
                     then:
-                      - action: climate.set_temperature
+                      - action: climate.set_hvac_mode
                         target: !input target_climates
                         data:
-                          temperature: !input target_temperature
                           hvac_mode: "cool"
                   - if:
                       - condition: template
@@ -384,6 +461,30 @@ actions:
                     then:
                       - action: switch.turn_on
                         target: !input ac_contactors
+                  - if:
+                      - condition: template
+                        value_template: "{{ hay_luces }}"
+                    then:
+                      - if:
+                          - condition: template
+                            value_template: "{{ hay_clima or hay_contactor }}"
+                        then:
+                          - delay:
+                              milliseconds: 500
+                      - action: homeassistant.turn_on
+                        target: !input target_lights
+                  # El modo y la temperatura van en pasos separados: varios termostatos Z-Wave
+                  # ignoran la temperatura si llega junto con el cambio de modo
+                  - if:
+                      - condition: template
+                        value_template: "{{ hay_clima }}"
+                    then:
+                      - delay:
+                          milliseconds: 500
+                      - action: climate.set_temperature
+                        target: !input target_climates
+                        data:
+                          temperature: !input target_temperature
           - &puerta_abierta
             alias: "Puerta abierta: tras el tiempo, apagar aire y luego luces (sin mirar movimiento)"
             sequence:
@@ -441,12 +542,22 @@ actions:
                     target: !input ac_contactors
               - if:
                   - condition: template
-                    value_template: "{{ hay_luces }}"
+                    value_template: "{{ hay_luces or hay_extra }}"
                 then:
                   - delay:
                       seconds: !input delay_off_device
-                  - action: homeassistant.turn_off
-                    target: !input target_lights
+                  - if:
+                      - condition: template
+                        value_template: "{{ hay_luces }}"
+                    then:
+                      - action: homeassistant.turn_off
+                        target: !input target_lights
+                  - if:
+                      - condition: template
+                        value_template: "{{ hay_extra }}"
+                    then:
+                      - action: homeassistant.turn_off
+                        target: !input extra_off
               # Sigue en PUERTA_ABIERTA hasta que cierren la puerta
 
       # ── Se cierra la puerta (o movimiento estando libre): SCAN para confirmar ocupación ──
@@ -545,7 +656,7 @@ actions:
                   - *ocupado
                 else:
                   - &vaciar
-                    alias: "Espacio vacío: apagar o subir el aire, y apagar luces"
+                    alias: "Espacio vacío: apagar o subir el aire, quedar LIBRE y luego apagar luces"
                     sequence:
                       - if:
                           - condition: template
@@ -581,41 +692,82 @@ actions:
                         then:
                           - action: switch.turn_off
                             target: !input ac_contactors
+                      # LIBRE antes de la espera: si abren la puerta mientras las luces siguen
+                      # encendidas, es una entrada desde LIBRE y se vuelve a encender todo
+                      - &quedar_libre
+                        alias: "Cuenta a cero y estado LIBRE"
+                        sequence:
+                          - if:
+                              - condition: template
+                                value_template: "{{ hay_cuenta }}"
+                            then:
+                              - action: input_number.set_value
+                                target:
+                                  entity_id: "{{ countdown_entity }}"
+                                data:
+                                  value: 0
+                          - if:
+                              - condition: template
+                                value_template: "{{ hay_anterior }}"
+                            then:
+                              - action: input_text.set_value
+                                target:
+                                  entity_id: "{{ previous_status_entity }}"
+                                data:
+                                  value: "{{ previous_status }}"
+                          # Vuelve a disparar la automatización, pero "libre_manual" lo descarta (es ella misma)
+                          - action: input_select.select_option
+                            target:
+                              entity_id: !input classroom_status
+                            data:
+                              option: "LIBRE"
                       - if:
                           - condition: template
-                            value_template: "{{ hay_luces }}"
+                            value_template: "{{ hay_luces or hay_extra }}"
                         then:
                           - delay:
                               seconds: !input delay_off_device
-                          - action: homeassistant.turn_off
-                            target: !input target_lights
-                  - &quedar_libre
-                    alias: "Cuenta a cero y estado LIBRE"
-                    sequence:
-                      - if:
-                          - condition: template
-                            value_template: "{{ hay_cuenta }}"
-                        then:
-                          - action: input_number.set_value
-                            target:
-                              entity_id: "{{ countdown_entity }}"
-                            data:
-                              value: 0
-                      - if:
-                          - condition: template
-                            value_template: "{{ hay_anterior }}"
-                        then:
-                          - action: input_text.set_value
-                            target:
-                              entity_id: "{{ previous_status_entity }}"
-                            data:
-                              value: "{{ previous_status }}"
-                      # Vuelve a disparar la automatización, pero "libre_manual" lo descarta (es ella misma)
-                      - action: input_select.select_option
-                        target:
-                          entity_id: !input classroom_status
-                        data:
-                          option: "LIBRE"
+                          - if:
+                              - condition: template
+                                value_template: "{{ hay_luces }}"
+                            then:
+                              - action: homeassistant.turn_off
+                                target: !input target_lights
+                          - if:
+                              - condition: template
+                                value_template: "{{ hay_extra }}"
+                            then:
+                              - action: homeassistant.turn_off
+                                target: !input extra_off
+
+      # ── Alguien manipula un interruptor o el termostato durante el SCAN: hay gente ──
+      - conditions:
+          - condition: trigger
+            id: "manipulacion"
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ hay_cuenta }}"
+            then:
+              - action: input_number.set_value
+                target:
+                  entity_id: "{{ countdown_entity }}"
+                data:
+                  value: 0
+          - if:
+              - condition: template
+                value_template: "{{ hay_anterior }}"
+            then:
+              - action: input_text.set_value
+                target:
+                  entity_id: "{{ previous_status_entity }}"
+                data:
+                  value: "{{ previous_status }}"
+          - action: input_select.select_option
+            target:
+              entity_id: !input classroom_status
+            data:
+              option: "OCUPADO"
 
       # ── Protección: OCUPADO sin movimiento durante el tiempo máximo ──
       - conditions:
@@ -623,7 +775,6 @@ actions:
             id: "ocupado_sin_movimiento"
         sequence:
           - *vaciar
-          - *quedar_libre
 
       # ── Fin de jornada: pasa a manual; si no está OCUPADO, apaga lo que quede ──
       - conditions:
