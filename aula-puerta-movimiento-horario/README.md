@@ -4,7 +4,7 @@
 
 Blueprint de automatización de Home Assistant para **salones de clase con sensor de puerta y sensor de movimiento**. Controla el aire acondicionado y las luces según la puerta, el movimiento, el horario escolar y los días hábiles.
 
-Archivo: `aula_puerta_horario.yaml` · Autor: NovaEnergyCo · Requiere Home Assistant 2024.10 o superior.
+Archivo: `aula_puerta_horario.yaml` · Versión 2.1 · Autor: NovaEnergyCo · Requiere Home Assistant 2024.10 o superior.
 
 ---
 
@@ -47,8 +47,8 @@ stateDiagram-v2
     LIBRE --> PUERTA_ABIERTA: abren la puerta<br/>(en automático enciende)
     PUERTA_ABIERTA --> PUERTA_ABIERTA: pasa el tiempo<br/>apaga aire y luego luces
     PUERTA_ABIERTA --> SCAN: cierran la puerta
-    SCAN --> OCUPADO: hay movimiento<br/>(reanuda el aire si estaba apagado)
-    SCAN --> LIBRE: nadie se movió<br/>apaga o sube el aire, apaga luces
+    SCAN --> OCUPADO: hay movimiento o tocan un interruptor/termostato<br/>(reanuda el aire si estaba apagado)
+    SCAN --> LIBRE: nadie se movió<br/>apaga o sube el aire; luego apaga luces
     OCUPADO --> PUERTA_ABIERTA: abren la puerta
     LIBRE --> SCAN: movimiento con la puerta cerrada<br/>(en automático enciende)
     OCUPADO --> LIBRE: escena nocturna o persona elige LIBRE<br/>(apaga todo)
@@ -56,11 +56,11 @@ stateDiagram-v2
 
 ### Paso a paso
 
-1. **Llegan y abren la puerta.** Si el salón estaba LIBRE y es horario de clase, se encienden las luces y el aire a la temperatura de ocupación.
-2. **Cierran la puerta.** Empieza el SCAN. Basta con que alguien se mueva para confirmar OCUPADO al instante.
+1. **Llegan y abren la puerta.** Si el salón estaba LIBRE y es horario de clase, se enciende el aire, medio segundo después las luces y luego se fija la temperatura de ocupación.
+2. **Cierran la puerta.** Empieza el SCAN. Basta con que alguien se mueva, o que prenda/apague un interruptor o cambie el termostato, para confirmar OCUPADO al instante.
 3. **Dejan la puerta abierta.** Tras el tiempo configurado (5 min por defecto) se apaga el aire y, un minuto después, las luces. **No importa si hay movimiento**: el salón queda así hasta que cierren la puerta.
 4. **Vuelven a cerrar la puerta con gente adentro.** Con el primer movimiento se reanudan el aire y las luces.
-5. **Salen todos y cierran la puerta.** Si nadie se mueve durante el SCAN, el salón pasa a LIBRE: el aire se apaga (o sube a la temperatura de no ocupación) y luego se apagan las luces.
+5. **Salen todos y cierran la puerta.** Si nadie se mueve durante el SCAN, el aire se apaga (o sube a la temperatura de no ocupación), el salón pasa a LIBRE y, tras la espera, se apagan las luces y las cargas extra. Si en esa espera alguien abre la puerta, cuenta como una entrada y se vuelve a encender todo.
 6. **Salen y dejan la puerta abierta.** La cuenta de puerta abierta apaga todo.
 7. **Fin de la jornada.** El modo pasa a manual. Si el salón no está ocupado, se apaga todo. Si todavía hay clase, se apagará cuando se vayan.
 8. **De noche.** La escena nocturna pone el salón en LIBRE y el blueprint apaga todo.
@@ -78,6 +78,10 @@ stateDiagram-v2
 |---|---|
 | **Regla de puerta abierta** | Apaga el aire y luego las luces si la puerta queda abierta, haya o no movimiento. |
 | **SCAN robusto** | Confirma la ocupación con cualquier movimiento nuevo **o** si el sensor sigue encendido al terminar. Funciona con sensores de tiempo corto y largo. |
+| **Manipulación = ocupado** (opcional) | Si durante el SCAN alguien prende o apaga un interruptor, o cambia el modo o la temperatura del termostato, pasa a OCUPADO sin esperar. Ignora los cambios que hacen las automatizaciones (MASTER OFF, sincronización del botón AC, el propio blueprint). |
+| **Reentrada durante el apagado** | Si abren la puerta cuando el aire ya se apagó y las luces todavía no, se trata como una entrada y vuelve a encender. |
+| **Encendido en orden** | Primero el aire, medio segundo después las luces y luego la temperatura, en un paso aparte del modo para que los termostatos Z-Wave sí la apliquen. |
+| **Cargas extra que solo se apagan** (opcional) | Luces o cargas que no se encienden con el salón (por ejemplo, las de ambiente), pero que se apagan junto con las luces. |
 | **Reanudación al cerrar** | Si la puerta apagó el aire y la cierran con gente, el aire vuelve con el primer movimiento. Si se fueron todos, no se enciende. |
 | **Respeta las luces del profesor** | Confirmar ocupación no vuelve a prender luces que el profesor apagó (por ejemplo, para proyectar). |
 | **Entrada sin evento de puerta** | Si hay movimiento con el salón LIBRE y la puerta cerrada, enciende y confirma con el SCAN. |
@@ -117,9 +121,11 @@ En los campos de luces, termostatos y contactores selecciona **entidades**, no �
 |---|---|---|
 | Sensor de puerta | — | `binary_sensor` de tipo puerta. |
 | Sensores de movimiento | — | Uno o varios. Pueden ser `binary_sensor` o `switch` (contacto seco CS del sensor de 110 V). |
-| Iluminación | vacío | Opcional. |
+| Iluminación | vacío | Opcional. Luces que se encienden y se apagan con el salón. |
+| Apagar también al quedar libre | vacío | Opcional. Luces o cargas que solo se apagan (por ejemplo, las de ambiente del IT2). |
 | Termostatos | vacío | Opcional. |
 | Aire por contactor | vacío | Opcional. |
+| Actuadores que indican presencia | vacío | Opcional. Normalmente los canales de luz del salón, el botón AC y el termostato. Vacío = desactivado. |
 | Hora de inicio / fin | 06:00 / 14:00 | Según la jornada del colegio. |
 | Al quedar libre | Apagar el aire | Con contactor siempre se apaga. |
 | Temperatura de ocupación | 23 °C | |
@@ -134,6 +140,21 @@ En los campos de luces, termostatos y contactores selecciona **entidades**, no �
 Al cerrar la puerta, el sensor puede seguir encendido por la persona que acaba de salir. Si el sensor dura más que el SCAN, el blueprint lo toma como gente adentro y el salón queda OCUPADO vacío hasta la escena nocturna.
 
 **Regla:** Tiempo de Scan > tiempo de encendido del sensor. Con el SCAN por defecto (420 s), ajusta el sensor (la perilla de tiempo del CS) a **4 minutos o menos**. Un sensor de 30 s a 2 min da los mejores resultados.
+
+---
+
+## Novedades de la versión 2.1
+
+Cambios a partir de la prueba en Colegio Karl C. Parrish (Elemental 2, octubre de 2026). Las automatizaciones de la 2.0 siguen funcionando sin reconfigurar; los dos campos nuevos son opcionales.
+
+| Cambio | Por qué |
+|---|---|
+| Al quedar libre, el estado pasa a LIBRE **antes** de la espera de luces | Si abrían la puerta en esa espera, el aire quedaba apagado con gente (en 5A, 11 min hasta que la docente lo prendió). Ahora esa apertura es una entrada y enciende. |
+| Si abren la puerta en SCAN con el aire apagado y las luces encendidas, enciende | Mismo caso, cubierto también cuando otra cosa apagó el aire durante el scan. |
+| Encendido: aire primero, luces medio segundo después | Una puerta que se cerraba a los pocos segundos cortaba el encendido antes de llegar al aire. |
+| Modo y temperatura en pasos separados | Los TCEN Z-Wave cambiaban el modo pero ignoraban la temperatura (1 de 13 encendidos quedaba en 23 °C). |
+| Campo nuevo **Apagar también al quedar libre** | Separar las luces que se encienden de las que solo se apagan. |
+| Campo nuevo **Actuadores que indican presencia** | Si alguien toca un interruptor o el termostato durante el SCAN, hay gente: no tiene sentido seguir escaneando. |
 
 ---
 
@@ -191,5 +212,6 @@ Esta versión se midió con su SCAN por defecto (420 s) y las otras dos con 300 
 - **Visitas cortas en automático encienden el salón.** Un conserje que abre la puerta un minuto en horario de clase deja el aire unos 7 min y las luces unos 8 min (SCAN de 420 s y 60 s de espera entre aire y luces). Fuera del horario no enciende.
 - **Clases casi inmóviles.** Con movimiento cada 5 min o más y un sensor de 4 min, en uno de cada cinco casos el salón puede pasar a LIBRE. En cuanto alguien se mueva con la puerta cerrada, vuelve a encender.
 - **Sensor mal ajustado.** Si el sensor dura más que el SCAN, el salón puede quedar OCUPADO vacío hasta la escena nocturna (ver "El ajuste más importante").
-- **Selección por área o dispositivo.** En luces, termostatos y contactores hay que elegir entidades.
-- **Pendiente de verificar en un salón real:** que el LIBRE que pone el propio blueprint no se confunda con un LIBRE manual o de escena. En el simulador funciona; falta confirmarlo en Home Assistant.
+- **Selección por área o dispositivo.** En luces, cargas extra, termostatos y contactores hay que elegir entidades.
+- **Confirmaciones tardías de Z-Wave.** Un interruptor que confirma un comando más de 10 s después de que el blueprint actuó puede tomarse como manipulación y pasar a OCUPADO. Es raro y, en el peor caso, la protección por tiempo máximo lo corrige.
+- **Encendido cortado.** El encendido completo tarda alrededor de 1 s (aire, luces y temperatura). Si la puerta se cierra antes, la temperatura puede quedar sin fijarse; el aire y las luces ya quedaron encendidos.
