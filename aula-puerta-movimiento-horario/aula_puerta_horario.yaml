@@ -1,14 +1,14 @@
 blueprint:
   name: Aula inteligente - Puerta, movimiento y horario
   description: >-
-    Versión 2.1. Para salones CON sensor de puerta. La puerta manda; el movimiento confirma si hay gente.
+    Versión 2.3. Para salones CON sensor de puerta. La puerta manda; el movimiento confirma si hay gente.
     Con horario y Workday:
 
-    - Se abre la puerta: si estaba LIBRE y en automático, enciende (primero el aire y medio segundo
-      después las luces). Si estaba en SCAN con el aire ya apagado y las luces todavía encendidas,
-      también lo trata como una entrada. Si la puerta queda abierta el tiempo configurado, apaga primero
-      el aire y después las luces, AUNQUE HAYA MOVIMIENTO (la puerta debe permanecer cerrada). Queda en
-      PUERTA_ABIERTA hasta que la cierren.
+    - Se abre la puerta: si estaba LIBRE y en automático, enciende (primero el aire y su temperatura,
+      luego las luces; a los 20 s reenvía la temperatura si el termostato no la tomó). Si la puerta
+      queda abierta el tiempo configurado, apaga primero el aire y después las luces, AUNQUE HAYA
+      MOVIMIENTO (la puerta debe permanecer cerrada). Queda en PUERTA_ABIERTA hasta que la cierren, y
+      el aire solo vuelve cuando se confirma que hay gente.
 
     - Se cierra la puerta: SCAN. Hay gente si el movimiento se activa durante el scan, si sigue activo
       al terminarlo o si alguien manipula un interruptor o un termostato. Con gente: OCUPADO (y si el
@@ -21,11 +21,14 @@ blueprint:
     - Protección: OCUPADO sin ningún movimiento durante el tiempo máximo → apaga (0 = desactivada).
 
     - Hora de inicio (día hábil según Workday): pasa a AUTOMÁTICO. Hora de fin: pasa a MANUAL y
-      apaga si el salón está vacío. En MANUAL nunca enciende, solo apaga.
+      apaga si el salón está vacío. En MANUAL nunca enciende, solo apaga. Con un calendario de horas
+      operativas, el inicio y el fin son los de cada evento del calendario en lugar de horas fijas.
 
     - LIBRE elegido por una persona o una escena (p. ej. la escena nocturna): apaga todo.
 
-    - Al reiniciar Home Assistant retoma la cuenta que haya quedado a medias.
+    - Al reiniciar Home Assistant no confía en el estado guardado: con la puerta abierta corre la
+      cuenta de puerta abierta; con la puerta cerrada y movimiento o equipos encendidos hace un SCAN;
+      sin nada, queda LIBRE.
 
     El Tiempo de Scan debe ser MAYOR que el tiempo que el sensor de movimiento se queda encendido.
 
@@ -134,14 +137,27 @@ blueprint:
         entity:
           domain: binary_sensor
 
+    operating_calendar:
+      name: Calendario de horas operativas (Opcional)
+      description: >-
+        Si se indica, el horario lo marca este calendario: al empezar un evento pasa a AUTOMÁTICO
+        (si el Workday dice que es día hábil) y al terminar pasa a MANUAL. Las horas de inicio y fin
+        de abajo se ignoran. Vacío = se usan las horas fijas.
+      default: ""
+      selector:
+        entity:
+          domain: calendar
+
     start_time:
       name: Hora de inicio
+      description: "Se ignora si hay calendario de horas operativas."
       default: "06:00:00"
       selector:
         time: {}
 
     end_time:
       name: Hora de fin
+      description: "Se ignora si hay calendario de horas operativas."
       default: "14:00:00"
       selector:
         time: {}
@@ -253,6 +269,12 @@ variables:
   status_entity_top: !input classroom_status
   door_entity: !input door_sensor
   max_sin_movimiento: !input max_sin_movimiento
+  calendario: !input operating_calendar
+  temp_objetivo: !input target_temperature
+
+# Disponible en las plantillas de los disparadores
+trigger_variables:
+  cal: !input operating_calendar
 
 triggers:
   - trigger: state
@@ -304,6 +326,15 @@ triggers:
     at: !input end_time
     id: "fin"
 
+  # Calendario de horas operativas: empieza / termina un evento
+  - trigger: template
+    value_template: "{{ cal not in ['', none] and is_state(cal, 'on') }}"
+    id: "inicio_cal"
+
+  - trigger: template
+    value_template: "{{ cal not in ['', none] and is_state(cal, 'off') }}"
+    id: "fin_cal"
+
   - trigger: homeassistant
     event: start
     id: "arranque"
@@ -326,19 +357,31 @@ conditions:
         true
       {%- endif -%}
   # Manipulación: solo durante el SCAN, sin estados inválidos, y si no la hizo una automatización o un
-  # script (su cambio lleva el contexto de esa ejecución). Los 10 s después de un disparo de esta
-  # automatización se ignoran: son confirmaciones tardías de sus propios comandos Z-Wave.
+  # script (su cambio lleva el contexto de esa ejecución). Se ignoran las confirmaciones tardías de
+  # los propios comandos: 10 s después de un disparo para interruptores; para termostatos, 45 s después
+  # de un disparo, 75 s después de que el aire se encendió, o si la nueva temperatura es la de ocupación.
   - condition: template
     value_template: >-
       {%- if trigger.id == 'manipulacion' -%}
         {%- set invalidos = ['unavailable', 'unknown'] -%}
         {%- set ctx = trigger.to_state.context.id if trigger.to_state is not none else '' -%}
+        {%- set es_clima = trigger.entity_id.startswith('climate.') -%}
+        {%- set desde_disparo = (as_timestamp(now()) - as_timestamp(this.attributes.last_triggered, 0))
+              if this is defined else 999 -%}
+        {%- set eco_clima = false -%}
+        {%- if es_clima and trigger.to_state is not none and trigger.from_state is not none
+              and trigger.to_state.state == trigger.from_state.state -%}
+          {%- set desde_encendido = as_timestamp(now()) - as_timestamp(trigger.to_state.last_changed, 0) -%}
+          {%- set nueva = trigger.to_state.attributes.temperature | float(-100) -%}
+          {%- set eco_clima = desde_encendido < 75 or (nueva - temp_objetivo | float(0)) | abs <= 0.6 -%}
+        {%- endif -%}
         {{ is_state(status_entity_top, 'SCAN')
            and trigger.from_state is not none and trigger.to_state is not none
            and trigger.from_state.state not in invalidos and trigger.to_state.state not in invalidos
            and states.automation | selectattr('context.id', 'eq', ctx) | list | count == 0
            and states.script | selectattr('context.id', 'eq', ctx) | list | count == 0
-           and (this is not defined or as_timestamp(now()) - as_timestamp(this.attributes.last_triggered, 0) > 10) }}
+           and desde_disparo > (45 if es_clima else 10)
+           and not eco_clima }}
       {%- else -%}
         true
       {%- endif -%}
@@ -348,10 +391,14 @@ conditions:
     value_template: >-
       {{ trigger.id != 'libre_manual' or this is not defined or this.context is not defined
          or trigger.to_state.context.id != this.context.id }}
+  # Con calendario de horas operativas, las horas fijas no cuentan
+  - condition: template
+    value_template: >-
+      {{ trigger.id not in ['inicio', 'fin'] or calendario in ['', none] }}
   # El inicio de jornada solo en días hábiles
   - condition: template
     value_template: >-
-      {{ trigger.id != 'inicio' or workday_entity in ['', none] or is_state(workday_entity, 'on') }}
+      {{ trigger.id not in ['inicio', 'inicio_cal'] or workday_entity in ['', none] or is_state(workday_entity, 'on') }}
 
 actions:
   - variables:
@@ -377,15 +424,14 @@ actions:
       hay_movimiento: >-
         {%- set lista = [motion_sensors_list] if motion_sensors_list is string else motion_sensors_list -%}
         {{ lista | select('is_state', 'on') | list | count > 0 }}
-      # Aire (termostatos + contactores) todo apagado, y luces con alguna encendida
-      aire_apagado: >-
-        {%- set c = climate_list.entity_id | default([]) -%}
-        {%- set k = contactors_list.entity_id | default([]) -%}
-        {%- set aire = ([c] if c is string else c) + ([k] if k is string else k) -%}
-        {{ aire | count > 0 and aire | reject('is_state', 'off') | list | count == 0 }}
-      luces_encendidas: >-
-        {%- set l = lights_list.entity_id | default([]) -%}
-        {{ ([l] if l is string else l) | select('is_state', 'on') | list | count > 0 }}
+      # Algún equipo del salón encendido (aire, contactor, luces o cargas extra)
+      equipo_encendido: >-
+        {%- set ns = namespace(ids=[]) -%}
+        {%- for g in [climate_list, contactors_list, lights_list, extra_list] -%}
+          {%- set i = g.entity_id | default([]) if g is mapping else [] -%}
+          {%- set ns.ids = ns.ids + ([i] if i is string else i) -%}
+        {%- endfor -%}
+        {{ ns.ids | reject('is_state', ['off', 'unavailable', 'unknown']) | list | count > 0 }}
 
   - choose:
       # ── Una persona o una escena eligió LIBRE: apagar todo ──
@@ -410,6 +456,7 @@ actions:
                     value_template: "{{ hay_clima }}"
                 then:
                   - action: climate.set_hvac_mode
+                    continue_on_error: true
                     target: !input target_climates
                     data:
                       hvac_mode: "off"
@@ -418,18 +465,21 @@ actions:
                     value_template: "{{ hay_contactor }}"
                 then:
                   - action: switch.turn_off
+                    continue_on_error: true
                     target: !input ac_contactors
               - if:
                   - condition: template
                     value_template: "{{ hay_luces }}"
                 then:
                   - action: homeassistant.turn_off
+                    continue_on_error: true
                     target: !input target_lights
               - if:
                   - condition: template
                     value_template: "{{ hay_extra }}"
                 then:
                   - action: homeassistant.turn_off
+                    continue_on_error: true
                     target: !input extra_off
 
       # ── Se abre la puerta: encender si es una entrada; si queda abierta, apagar aire y luego luces ──
@@ -437,21 +487,21 @@ actions:
           - condition: trigger
             id: "puerta_abre"
         sequence:
-          # Entrada: venía de LIBRE, o de un SCAN que ya apagó el aire y está por apagar las luces
+          # Entrada: solo si venía de LIBRE. Si el aire lo apagó la puerta abierta, vuelve únicamente
+          # cuando se confirma que hay gente (scan o manipulación), no con la siguiente apertura.
           - if:
               - condition: template
-                value_template: >-
-                  {{ is_state(modo_auto, 'on') and (previous_status == 'LIBRE'
-                     or (previous_status == 'SCAN' and aire_apagado and luces_encendidas)) }}
+                value_template: "{{ is_state(modo_auto, 'on') and previous_status == 'LIBRE' }}"
             then:
               - &encender
-                alias: "Encender: aire, medio segundo después luces, y luego la temperatura"
+                alias: "Encender: aire, 1 s después la temperatura, y luego las luces"
                 sequence:
                   - if:
                       - condition: template
                         value_template: "{{ hay_clima }}"
                     then:
                       - action: climate.set_hvac_mode
+                        continue_on_error: true
                         target: !input target_climates
                         data:
                           hvac_mode: "cool"
@@ -460,31 +510,29 @@ actions:
                         value_template: "{{ hay_contactor }}"
                     then:
                       - action: switch.turn_on
+                        continue_on_error: true
                         target: !input ac_contactors
-                  - if:
-                      - condition: template
-                        value_template: "{{ hay_luces }}"
-                    then:
-                      - if:
-                          - condition: template
-                            value_template: "{{ hay_clima or hay_contactor }}"
-                        then:
-                          - delay:
-                              milliseconds: 500
-                      - action: homeassistant.turn_on
-                        target: !input target_lights
                   # El modo y la temperatura van en pasos separados: varios termostatos Z-Wave
-                  # ignoran la temperatura si llega junto con el cambio de modo
+                  # ignoran la temperatura si llega junto con el cambio de modo. La temperatura va
+                  # antes que las luces para que una puerta que se cierra rápido no la cancele.
                   - if:
                       - condition: template
                         value_template: "{{ hay_clima }}"
                     then:
                       - delay:
-                          milliseconds: 500
+                          seconds: 1
                       - action: climate.set_temperature
+                        continue_on_error: true
                         target: !input target_climates
                         data:
                           temperature: !input target_temperature
+                  - if:
+                      - condition: template
+                        value_template: "{{ hay_luces }}"
+                    then:
+                      - action: homeassistant.turn_on
+                        continue_on_error: true
+                        target: !input target_lights
           - &puerta_abierta
             alias: "Puerta abierta: tras el tiempo, apagar aire y luego luces (sin mirar movimiento)"
             sequence:
@@ -515,6 +563,30 @@ actions:
                             entity_id: "{{ countdown_entity }}"
                           data:
                             value: "{{ door_time - (repeat.index - 1) * 10 }}"
+                    - &confirmar_temp
+                      alias: "Confirmar la temperatura: reenviarla entre 20 y 40 s después de encender el aire si el termostato no la tomó"
+                      repeat:
+                        for_each: >-
+                          {%- set ids = climate_list.entity_id | default([]) -%}
+                          {%- set ns = namespace(r=[]) -%}
+                          {%- for e in ([ids] if ids is string else ids) -%}
+                            {%- set s = states[e] -%}
+                            {%- if s is not none and s.state == 'cool' -%}
+                              {%- set edad = as_timestamp(now()) - as_timestamp(s.last_changed) -%}
+                              {%- if 20 <= edad < 40
+                                    and (s.attributes.temperature | float(-100) - temp_objetivo | float(0)) | abs > 0.6 -%}
+                                {%- set ns.r = ns.r + [e] -%}
+                              {%- endif -%}
+                            {%- endif -%}
+                          {%- endfor -%}
+                          {{ ns.r }}
+                        sequence:
+                          - action: climate.set_temperature
+                            continue_on_error: true
+                            target:
+                              entity_id: "{{ repeat.item }}"
+                            data:
+                              temperature: !input target_temperature
                     - delay:
                         seconds: 10
               - if:
@@ -531,6 +603,7 @@ actions:
                     value_template: "{{ hay_clima }}"
                 then:
                   - action: climate.set_hvac_mode
+                    continue_on_error: true
                     target: !input target_climates
                     data:
                       hvac_mode: "off"
@@ -539,6 +612,7 @@ actions:
                     value_template: "{{ hay_contactor }}"
                 then:
                   - action: switch.turn_off
+                    continue_on_error: true
                     target: !input ac_contactors
               - if:
                   - condition: template
@@ -551,12 +625,14 @@ actions:
                         value_template: "{{ hay_luces }}"
                     then:
                       - action: homeassistant.turn_off
+                        continue_on_error: true
                         target: !input target_lights
                   - if:
                       - condition: template
                         value_template: "{{ hay_extra }}"
                     then:
                       - action: homeassistant.turn_off
+                        continue_on_error: true
                         target: !input extra_off
               # Sigue en PUERTA_ABIERTA hasta que cierren la puerta
 
@@ -605,6 +681,7 @@ actions:
                             entity_id: "{{ countdown_entity }}"
                           data:
                             value: "{{ scanning_time - (repeat.index - 1) * 10 }}"
+                    - *confirmar_temp
                     - wait_for_trigger:
                         - trigger: state
                           entity_id: !input motion_sensors
@@ -645,6 +722,27 @@ actions:
                                 entity_id: !input classroom_status
                               data:
                                 option: "OCUPADO"
+                            - &esperar_confirmar
+                              alias: "Si el aire se acaba de encender, esperar a los 20 s y confirmar la temperatura"
+                              sequence:
+                                - variables:
+                                    espera_confirmar: >-
+                                      {%- set ids = climate_list.entity_id | default([]) -%}
+                                      {%- set ns = namespace(m=999) -%}
+                                      {%- for e in ([ids] if ids is string else ids) -%}
+                                        {%- set s = states[e] -%}
+                                        {%- if s is not none and s.state == 'cool' -%}
+                                          {%- set ns.m = [ns.m, as_timestamp(now()) - as_timestamp(s.last_changed)] | min -%}
+                                        {%- endif -%}
+                                      {%- endfor -%}
+                                      {{ (21 - ns.m) | round(0) | int if ns.m < 20 else 0 }}
+                                - if:
+                                    - condition: template
+                                      value_template: "{{ espera_confirmar | int(0) > 0 }}"
+                                  then:
+                                    - delay:
+                                        seconds: "{{ espera_confirmar | int(0) }}"
+                                    - *confirmar_temp
                         - stop: "Ocupación confirmada"
               # Sin una nueva detección: hay gente solo si el sensor sigue encendido (se quedó activo todo el scan)
               - if:
@@ -673,6 +771,7 @@ actions:
                                     {{ ([ids] if ids is string else ids) | reject('is_state', 'off') | list }}
                                   sequence:
                                     - action: climate.set_temperature
+                                      continue_on_error: true
                                       target:
                                         entity_id: "{{ repeat.item }}"
                                       data:
@@ -683,6 +782,7 @@ actions:
                                 value_template: "{{ hay_clima }}"
                             then:
                               - action: climate.set_hvac_mode
+                                continue_on_error: true
                                 target: !input target_climates
                                 data:
                                   hvac_mode: "off"
@@ -691,6 +791,7 @@ actions:
                             value_template: "{{ hay_contactor }}"
                         then:
                           - action: switch.turn_off
+                            continue_on_error: true
                             target: !input ac_contactors
                       # LIBRE antes de la espera: si abren la puerta mientras las luces siguen
                       # encendidas, es una entrada desde LIBRE y se vuelve a encender todo
@@ -732,12 +833,14 @@ actions:
                                 value_template: "{{ hay_luces }}"
                             then:
                               - action: homeassistant.turn_off
+                                continue_on_error: true
                                 target: !input target_lights
                           - if:
                               - condition: template
                                 value_template: "{{ hay_extra }}"
                             then:
                               - action: homeassistant.turn_off
+                                continue_on_error: true
                                 target: !input extra_off
 
       # ── Alguien manipula un interruptor o el termostato durante el SCAN: hay gente ──
@@ -779,7 +882,9 @@ actions:
       # ── Fin de jornada: pasa a manual; si no está OCUPADO, apaga lo que quede ──
       - conditions:
           - condition: trigger
-            id: "fin"
+            id:
+              - "fin"
+              - "fin_cal"
         sequence:
           - action: input_boolean.turn_off
             target:
@@ -801,7 +906,9 @@ actions:
       # ── Inicio de jornada: pasa a automático; si hay gente con la puerta cerrada, enciende ──
       - conditions:
           - condition: trigger
-            id: "inicio"
+            id:
+              - "inicio"
+              - "inicio_cal"
         sequence:
           - action: input_boolean.turn_on
             target:
@@ -823,6 +930,7 @@ actions:
                       entity_id: !input classroom_status
                     data:
                       option: "OCUPADO"
+                  - *esperar_confirmar
               # Interrumpió un scan: se repite
               - conditions:
                   - condition: template
@@ -830,19 +938,49 @@ actions:
                 sequence:
                   - *scan
 
-      # ── Reinicio de Home Assistant: retomar la cuenta que quedó a medias ──
+      # ── Reinicio de Home Assistant: reevaluar el salón (el estado guardado puede estar desactualizado
+      #    si el equipo se apagó de golpe) ──
       - conditions:
           - condition: trigger
             id: "arranque"
         sequence:
+          # Con calendario: si HA estuvo apagado al empezar o terminar un evento, alinear el modo
+          - if:
+              - condition: template
+                value_template: "{{ calendario not in ['', none] }}"
+            then:
+              - if:
+                  - condition: template
+                    value_template: >-
+                      {{ is_state(calendario, 'on')
+                         and (workday_entity in ['', none] or is_state(workday_entity, 'on')) }}
+                then:
+                  - action: input_boolean.turn_on
+                    target:
+                      entity_id: !input modo_auto
+                else:
+                  - action: input_boolean.turn_off
+                    target:
+                      entity_id: !input modo_auto
           - choose:
+              # Puerta abierta: corre la cuenta de puerta abierta (apaga si sigue abierta)
               - conditions:
                   - condition: template
-                    value_template: "{{ puerta_abierta and previous_status != 'LIBRE' }}"
+                    value_template: "{{ puerta_abierta }}"
                 sequence:
                   - *puerta_abierta
+              # Puerta cerrada con movimiento o equipos encendidos, o a medio confirmar: SCAN
               - conditions:
                   - condition: template
-                    value_template: "{{ not puerta_abierta and previous_status in ['SCAN', 'PUERTA_ABIERTA'] }}"
+                    value_template: >-
+                      {{ hay_movimiento or equipo_encendido
+                         or previous_status in ['SCAN', 'PUERTA_ABIERTA', 'OCUPADO'] }}
                 sequence:
                   - *scan
+            # Puerta cerrada, sin movimiento y todo apagado: LIBRE
+            default:
+              - if:
+                  - condition: template
+                    value_template: "{{ previous_status != 'LIBRE' }}"
+                then:
+                  - *quedar_libre

@@ -4,7 +4,7 @@
 
 Blueprint de automatización de Home Assistant para **salones de clase con sensor de puerta y sensor de movimiento**. Controla el aire acondicionado y las luces según la puerta, el movimiento, el horario escolar y los días hábiles.
 
-Archivo: `aula_puerta_horario.yaml` · Versión 2.1 · Autor: NovaEnergyCo · Requiere Home Assistant 2024.10 o superior.
+Archivo: `aula_puerta_horario.yaml` · Versión 2.3 · Autor: NovaEnergyCo · Requiere Home Assistant 2024.10 o superior.
 
 ---
 
@@ -56,10 +56,10 @@ stateDiagram-v2
 
 ### Paso a paso
 
-1. **Llegan y abren la puerta.** Si el salón estaba LIBRE y es horario de clase, se enciende el aire, medio segundo después las luces y luego se fija la temperatura de ocupación.
+1. **Llegan y abren la puerta.** Si el salón estaba LIBRE y es horario de clase, se enciende el aire, un segundo después se fija la temperatura de ocupación y luego se encienden las luces. A los 20 s, si el termostato no tomó la temperatura, se la vuelve a enviar.
 2. **Cierran la puerta.** Empieza el SCAN. Basta con que alguien se mueva, o que prenda/apague un interruptor o cambie el termostato, para confirmar OCUPADO al instante.
 3. **Dejan la puerta abierta.** Tras el tiempo configurado (5 min por defecto) se apaga el aire y, un minuto después, las luces. **No importa si hay movimiento**: el salón queda así hasta que cierren la puerta.
-4. **Vuelven a cerrar la puerta con gente adentro.** Con el primer movimiento se reanudan el aire y las luces.
+4. **Vuelven a cerrar la puerta con gente adentro.** Cuando el SCAN confirma que hay gente, se reanudan el aire y las luces. Abrir y cerrar la puerta otra vez no basta para que vuelva el aire.
 5. **Salen todos y cierran la puerta.** Si nadie se mueve durante el SCAN, el aire se apaga (o sube a la temperatura de no ocupación), el salón pasa a LIBRE y, tras la espera, se apagan las luces y las cargas extra. Si en esa espera alguien abre la puerta, cuenta como una entrada y se vuelve a encender todo.
 6. **Salen y dejan la puerta abierta.** La cuenta de puerta abierta apaga todo.
 7. **Fin de la jornada.** El modo pasa a manual. Si el salón no está ocupado, se apaga todo. Si todavía hay clase, se apagará cuando se vayan.
@@ -78,20 +78,23 @@ stateDiagram-v2
 |---|---|
 | **Regla de puerta abierta** | Apaga el aire y luego las luces si la puerta queda abierta, haya o no movimiento. |
 | **SCAN robusto** | Confirma la ocupación con cualquier movimiento nuevo **o** si el sensor sigue encendido al terminar. Funciona con sensores de tiempo corto y largo. |
-| **Manipulación = ocupado** (opcional) | Si durante el SCAN alguien prende o apaga un interruptor, o cambia el modo o la temperatura del termostato, pasa a OCUPADO sin esperar. Ignora los cambios que hacen las automatizaciones (MASTER OFF, sincronización del botón AC, el propio blueprint). |
-| **Reentrada durante el apagado** | Si abren la puerta cuando el aire ya se apagó y las luces todavía no, se trata como una entrada y vuelve a encender. |
-| **Encendido en orden** | Primero el aire, medio segundo después las luces y luego la temperatura, en un paso aparte del modo para que los termostatos Z-Wave sí la apliquen. |
+| **Manipulación = ocupado** (opcional) | Si durante el SCAN alguien prende o apaga un interruptor, o cambia el modo o la temperatura del termostato, pasa a OCUPADO sin esperar. Ignora los cambios que hacen las automatizaciones (MASTER OFF, sincronización del botón AC, el propio blueprint) y los reportes tardíos del termostato después de encenderlo. |
+| **Reentrada durante el apagado** | Si abren la puerta cuando el salón ya pasó a LIBRE y las luces todavía no se apagaron, se trata como una entrada y vuelve a encender. |
+| **Encendido en orden** | Primero el aire, un segundo después la temperatura (en un paso aparte del modo para que los termostatos Z-Wave sí la apliquen) y luego las luces. |
+| **Confirmación de temperatura** | Entre 20 y 40 s después de encender el aire, si el termostato no quedó en la temperatura de ocupación, se la reenvía una vez. Útil con mini split por IR y termostatos que restauran su valor anterior. |
 | **Cargas extra que solo se apagan** (opcional) | Luces o cargas que no se encienden con el salón (por ejemplo, las de ambiente), pero que se apagan junto con las luces. |
 | **Reanudación al cerrar** | Si la puerta apagó el aire y la cierran con gente, el aire vuelve con el primer movimiento. Si se fueron todos, no se enciende. |
 | **Respeta las luces del profesor** | Confirmar ocupación no vuelve a prender luces que el profesor apagó (por ejemplo, para proyectar). |
 | **Entrada sin evento de puerta** | Si hay movimiento con el salón LIBRE y la puerta cerrada, enciende y confirma con el SCAN. |
 | **Horario y días hábiles** | Hora de inicio y de fin. Con el sensor Workday solo arranca en días hábiles (festivos y fines de semana quedan en manual). |
+| **Calendario de horas operativas** (opcional) | En lugar de horas fijas, el AUTOMÁTICO sigue los eventos de un calendario: empieza y termina con cada evento. Sirve para horarios distintos por día (por ejemplo, sábado más corto). El Workday sigue filtrando los festivos. |
 | **Al quedar libre: apagar o subir** | Dentro del horario se puede apagar el aire o subirlo a una temperatura de no ocupación, para que el salón no se caliente entre clases. |
 | **Aire por termostato y/o contactor** | Maneja termostatos `climate` y contactores (switch del CC). El contactor no regula temperatura: en "subir" se apaga. |
 | **Apagado escalonado** | Primero el aire y después las luces, con una espera configurable. |
 | **Protección por tiempo máximo** | Si queda OCUPADO sin ningún movimiento durante el tiempo máximo (60 min por defecto), apaga. 0 = desactivada. |
 | **LIBRE manual o por escena** | Una persona o una escena (por ejemplo, la nocturna) pueden forzar LIBRE y el blueprint apaga todo. |
-| **Recuperación tras reinicio** | Si Home Assistant se reinicia a mitad de una cuenta, la retoma en vez de dejar equipos encendidos. |
+| **Recuperación tras reinicio** | Al arrancar no confía en el estado guardado (tras un apagón puede estar desactualizado): con la puerta abierta corre la cuenta de puerta abierta; con la puerta cerrada y movimiento o equipos encendidos hace un SCAN; sin nada, queda LIBRE. |
+| **Tolerante a fallas de Z-Wave** | Si un equipo no responde a una orden, la automatización sigue con los demás pasos en vez de detenerse y dejar el salón a medias. |
 | **Cuenta regresiva visible** (opcional) | Muestra en el tablero los segundos que faltan de la cuenta de puerta abierta o del SCAN. |
 | **Estado anterior visible** (opcional) | Muestra el estado anterior del salón, útil para diagnóstico. |
 
@@ -126,7 +129,8 @@ En los campos de luces, termostatos y contactores selecciona **entidades**, no �
 | Termostatos | vacío | Opcional. |
 | Aire por contactor | vacío | Opcional. |
 | Actuadores que indican presencia | vacío | Opcional. Normalmente los canales de luz del salón, el botón AC y el termostato. Vacío = desactivado. |
-| Hora de inicio / fin | 06:00 / 14:00 | Según la jornada del colegio. |
+| Calendario de horas operativas | vacío | Opcional. Si se indica, reemplaza las horas de inicio y fin. |
+| Hora de inicio / fin | 06:00 / 14:00 | Según la jornada del colegio. Se ignoran si hay calendario. |
 | Al quedar libre | Apagar el aire | Con contactor siempre se apaga. |
 | Temperatura de ocupación | 23 °C | |
 | Temperatura de no ocupación | 27 °C | Solo con "Subir". |
@@ -142,6 +146,25 @@ Al cerrar la puerta, el sensor puede seguir encendido por la persona que acaba d
 **Regla:** Tiempo de Scan > tiempo de encendido del sensor. Con el SCAN por defecto (420 s), ajusta el sensor (la perilla de tiempo del CS) a **4 minutos o menos**. Un sensor de 30 s a 2 min da los mejores resultados.
 
 ---
+
+## Novedades de la versión 2.3
+
+Cambios a partir de las pruebas del 30 de octubre de 2026 en Colegio Karl C. Parrish (7 salones) y Colegio Instecom (salón 102). Las automatizaciones de la 2.1 y la 2.2 siguen funcionando sin reconfigurar.
+
+| Cambio | Por qué |
+|---|---|
+| Al abrir la puerta solo se enciende si el salón estaba LIBRE (se quita la regla "SCAN con aire apagado y luces encendidas") | Después del apagado por puerta abierta, la siguiente apertura devolvía el aire en 1–5 min sin confirmar que hubiera gente (4 casos). El caso que cubría ya lo resuelve el LIBRE anticipado de la 2.1. |
+| Encendido: aire → 1 s → temperatura → luces | Si la puerta se cerraba en los primeros segundos, la temperatura, que iba al final, no se enviaba. |
+| Reenvío de la temperatura a los 20–40 s si el termostato no la tomó | Algunos termostatos aceptan la temperatura y a los 8–17 s vuelven a su valor anterior. |
+| Los reportes tardíos del termostato no cuentan como manipulación | El termostato confirma la temperatura 10–20 s después de recibirla, y eso confirmaba OCUPADO sin evidencia. |
+| Reevaluación al reiniciar Home Assistant | Tras un apagón, HA restauró LIBRE con gente adentro y el salón quedó 87 min mal. |
+| `continue_on_error` en las órdenes a equipos | Un error de Z-Wave (nodo que no responde) detenía la ejecución y podía dejar el salón sin pasar a LIBRE. |
+
+## Novedades de la versión 2.2
+
+- Campo nuevo opcional **Calendario de horas operativas**. Si se llena, el salón pasa a AUTOMÁTICO al empezar cada evento del calendario (si el Workday dice que es día hábil) y a MANUAL al terminar. Las horas fijas de inicio y fin se ignoran.
+- Al reiniciar Home Assistant con calendario, el modo se alinea con el calendario por si el reinicio coincidió con el inicio o el fin de un evento.
+- Sin calendario, funciona exactamente igual que la 2.1.
 
 ## Novedades de la versión 2.1
 
