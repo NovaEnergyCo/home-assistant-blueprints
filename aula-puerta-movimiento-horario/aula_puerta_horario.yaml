@@ -1,11 +1,12 @@
 blueprint:
   name: Aula inteligente - Puerta, movimiento y horario
   description: >-
-    Versión 2.3. Para salones CON sensor de puerta. La puerta manda; el movimiento confirma si hay gente.
+    Versión 2.4. Para salones CON sensor de puerta. La puerta manda; el movimiento confirma si hay gente.
     Con horario y Workday:
 
-    - Se abre la puerta: si estaba LIBRE y en automático, enciende (primero el aire y su temperatura,
-      luego las luces; a los 20 s reenvía la temperatura si el termostato no la tomó). Si la puerta
+    - Se abre la puerta: si estaba LIBRE y en automático, enciende a la vez el aire (con su temperatura
+      un segundo después) y las luces; a los 20 s reenvía la temperatura si el termostato no la tomó,
+      solo si el aire lo encendió el blueprint. Si la puerta
       queda abierta el tiempo configurado, apaga primero el aire y después las luces, AUNQUE HAYA
       MOVIMIENTO (la puerta debe permanecer cerrada). Queda en PUERTA_ABIERTA hasta que la cierren, y
       el aire solo vuelve cuando se confirma que hay gente.
@@ -494,45 +495,47 @@ actions:
                 value_template: "{{ is_state(modo_auto, 'on') and previous_status == 'LIBRE' }}"
             then:
               - &encender
-                alias: "Encender: aire, 1 s después la temperatura, y luego las luces"
-                sequence:
-                  - if:
-                      - condition: template
-                        value_template: "{{ hay_clima }}"
-                    then:
-                      - action: climate.set_hvac_mode
-                        continue_on_error: true
-                        target: !input target_climates
-                        data:
-                          hvac_mode: "cool"
-                  - if:
-                      - condition: template
-                        value_template: "{{ hay_contactor }}"
-                    then:
-                      - action: switch.turn_on
-                        continue_on_error: true
-                        target: !input ac_contactors
-                  # El modo y la temperatura van en pasos separados: varios termostatos Z-Wave
-                  # ignoran la temperatura si llega junto con el cambio de modo. La temperatura va
-                  # antes que las luces para que una puerta que se cierra rápido no la cancele.
-                  - if:
-                      - condition: template
-                        value_template: "{{ hay_clima }}"
-                    then:
-                      - delay:
-                          seconds: 1
-                      - action: climate.set_temperature
-                        continue_on_error: true
-                        target: !input target_climates
-                        data:
-                          temperature: !input target_temperature
-                  - if:
-                      - condition: template
-                        value_template: "{{ hay_luces }}"
-                    then:
-                      - action: homeassistant.turn_on
-                        continue_on_error: true
-                        target: !input target_lights
+                alias: "Encender: a la vez el aire (1 s después la temperatura) y las luces"
+                # En paralelo: un termostato lento o que no responde no retrasa las luces
+                parallel:
+                  - sequence:
+                      - if:
+                          - condition: template
+                            value_template: "{{ hay_clima }}"
+                        then:
+                          - action: climate.set_hvac_mode
+                            continue_on_error: true
+                            target: !input target_climates
+                            data:
+                              hvac_mode: "cool"
+                      - if:
+                          - condition: template
+                            value_template: "{{ hay_contactor }}"
+                        then:
+                          - action: switch.turn_on
+                            continue_on_error: true
+                            target: !input ac_contactors
+                      # El modo y la temperatura van en pasos separados: varios termostatos Z-Wave
+                      # ignoran la temperatura si llega junto con el cambio de modo
+                      - if:
+                          - condition: template
+                            value_template: "{{ hay_clima }}"
+                        then:
+                          - delay:
+                              seconds: 1
+                          - action: climate.set_temperature
+                            continue_on_error: true
+                            target: !input target_climates
+                            data:
+                              temperature: !input target_temperature
+                  - sequence:
+                      - if:
+                          - condition: template
+                            value_template: "{{ hay_luces }}"
+                        then:
+                          - action: homeassistant.turn_on
+                            continue_on_error: true
+                            target: !input target_lights
           - &puerta_abierta
             alias: "Puerta abierta: tras el tiempo, apagar aire y luego luces (sin mirar movimiento)"
             sequence:
@@ -550,6 +553,9 @@ actions:
                   entity_id: !input classroom_status
                 data:
                   option: "PUERTA_ABIERTA"
+              # Un aire encendido después de este momento lo prendió una persona: no se le toca la temperatura
+              - variables:
+                  desde_cuenta: "{{ as_timestamp(now()) }}"
               # Cuenta en tramos de 10 s; si cierran la puerta, el restart la cancela
               - repeat:
                   count: "{{ (door_time / 10) | int }}"
@@ -564,16 +570,17 @@ actions:
                           data:
                             value: "{{ door_time - (repeat.index - 1) * 10 }}"
                     - &confirmar_temp
-                      alias: "Confirmar la temperatura: reenviarla entre 20 y 40 s después de encender el aire si el termostato no la tomó"
+                      alias: "Confirmar la temperatura: reenviarla entre 20 y 40 s después de que el blueprint encendió el aire, si el termostato no la tomó (solo en automático)"
                       repeat:
                         for_each: >-
                           {%- set ids = climate_list.entity_id | default([]) -%}
                           {%- set ns = namespace(r=[]) -%}
-                          {%- for e in ([ids] if ids is string else ids) -%}
+                          {%- set limite = desde_cuenta | default(0) | float(0) + 5 -%}
+                          {%- for e in ([ids] if ids is string else ids) if is_state(modo_auto, 'on') -%}
                             {%- set s = states[e] -%}
                             {%- if s is not none and s.state == 'cool' -%}
                               {%- set edad = as_timestamp(now()) - as_timestamp(s.last_changed) -%}
-                              {%- if 20 <= edad < 40
+                              {%- if 20 <= edad < 40 and as_timestamp(s.last_changed) <= limite
                                     and (s.attributes.temperature | float(-100) - temp_objetivo | float(0)) | abs > 0.6 -%}
                                 {%- set ns.r = ns.r + [e] -%}
                               {%- endif -%}
@@ -668,6 +675,9 @@ actions:
                   entity_id: !input classroom_status
                 data:
                   option: "SCAN"
+              # Un aire encendido después de este momento lo prendió una persona: no se le toca la temperatura
+              - variables:
+                  desde_cuenta: "{{ as_timestamp(now()) }}"
               # Una nueva detección durante el scan confirma de inmediato
               - repeat:
                   count: "{{ (scanning_time / 10) | int }}"
@@ -705,16 +715,18 @@ actions:
                                     entity_id: "{{ countdown_entity }}"
                                   data:
                                     value: 0
+                            - variables:
+                                reanudar: >-
+                                  {%- set c = climate_list.entity_id | default([]) -%}
+                                  {%- set k = contactors_list.entity_id | default([]) -%}
+                                  {%- set aire = ([c] if c is string else c) + ([k] if k is string else k) -%}
+                                  {%- set l = lights_list.entity_id | default([]) -%}
+                                  {%- set equipo = aire if aire | count > 0 else ([l] if l is string else l) -%}
+                                  {{ is_state(modo_auto, 'on') and equipo | count > 0
+                                     and equipo | reject('is_state', 'off') | list | count == 0 }}
                             - if:
                                 - condition: template
-                                  value_template: >-
-                                    {%- set c = climate_list.entity_id | default([]) -%}
-                                    {%- set k = contactors_list.entity_id | default([]) -%}
-                                    {%- set aire = ([c] if c is string else c) + ([k] if k is string else k) -%}
-                                    {%- set l = lights_list.entity_id | default([]) -%}
-                                    {%- set equipo = aire if aire | count > 0 else ([l] if l is string else l) -%}
-                                    {{ is_state(modo_auto, 'on') and equipo | count > 0
-                                       and equipo | reject('is_state', 'off') | list | count == 0 }}
+                                  value_template: "{{ reanudar }}"
                               then:
                                 - *encender
                             - action: input_select.select_option
@@ -722,27 +734,33 @@ actions:
                                 entity_id: !input classroom_status
                               data:
                                 option: "OCUPADO"
-                            - &esperar_confirmar
-                              alias: "Si el aire se acaba de encender, esperar a los 20 s y confirmar la temperatura"
-                              sequence:
-                                - variables:
-                                    espera_confirmar: >-
-                                      {%- set ids = climate_list.entity_id | default([]) -%}
-                                      {%- set ns = namespace(m=999) -%}
-                                      {%- for e in ([ids] if ids is string else ids) -%}
-                                        {%- set s = states[e] -%}
-                                        {%- if s is not none and s.state == 'cool' -%}
-                                          {%- set ns.m = [ns.m, as_timestamp(now()) - as_timestamp(s.last_changed)] | min -%}
-                                        {%- endif -%}
-                                      {%- endfor -%}
-                                      {{ (21 - ns.m) | round(0) | int if ns.m < 20 else 0 }}
-                                - if:
-                                    - condition: template
-                                      value_template: "{{ espera_confirmar | int(0) > 0 }}"
-                                  then:
-                                    - delay:
-                                        seconds: "{{ espera_confirmar | int(0) }}"
-                                    - *confirmar_temp
+                            # Solo si el aire lo acaba de encender el blueprint
+                            - if:
+                                - condition: template
+                                  value_template: "{{ reanudar }}"
+                              then:
+                                - &esperar_confirmar
+                                  alias: "El blueprint acaba de encender el aire: esperar a los 20 s y confirmar la temperatura"
+                                  sequence:
+                                    - variables:
+                                        desde_cuenta: "{{ as_timestamp(now()) }}"
+                                        espera_confirmar: >-
+                                          {%- set ids = climate_list.entity_id | default([]) -%}
+                                          {%- set ns = namespace(m=999) -%}
+                                          {%- for e in ([ids] if ids is string else ids) -%}
+                                            {%- set s = states[e] -%}
+                                            {%- if s is not none and s.state == 'cool' -%}
+                                              {%- set ns.m = [ns.m, as_timestamp(now()) - as_timestamp(s.last_changed)] | min -%}
+                                            {%- endif -%}
+                                          {%- endfor -%}
+                                          {{ (21 - ns.m) | round(0) | int if ns.m < 20 else 0 }}
+                                    - if:
+                                        - condition: template
+                                          value_template: "{{ espera_confirmar | int(0) > 0 }}"
+                                      then:
+                                        - delay:
+                                            seconds: "{{ espera_confirmar | int(0) }}"
+                                        - *confirmar_temp
                         - stop: "Ocupación confirmada"
               # Sin una nueva detección: hay gente solo si el sensor sigue encendido (se quedó activo todo el scan)
               - if:

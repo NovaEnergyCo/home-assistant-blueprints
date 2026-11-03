@@ -4,7 +4,7 @@
 
 Blueprint de automatización de Home Assistant para **salones de clase con sensor de puerta y sensor de movimiento**. Controla el aire acondicionado y las luces según la puerta, el movimiento, el horario escolar y los días hábiles.
 
-Archivo: `aula_puerta_horario.yaml` · Versión 2.3 · Autor: NovaEnergyCo · Requiere Home Assistant 2024.10 o superior.
+Archivo: `aula_puerta_horario.yaml` · Versión 2.4 · Autor: NovaEnergyCo · Requiere Home Assistant 2024.10 o superior.
 
 ---
 
@@ -56,7 +56,7 @@ stateDiagram-v2
 
 ### Paso a paso
 
-1. **Llegan y abren la puerta.** Si el salón estaba LIBRE y es horario de clase, se enciende el aire, un segundo después se fija la temperatura de ocupación y luego se encienden las luces. A los 20 s, si el termostato no tomó la temperatura, se la vuelve a enviar.
+1. **Llegan y abren la puerta.** Si el salón estaba LIBRE y es horario de clase, se encienden a la vez el aire y las luces; un segundo después se fija la temperatura de ocupación. A los 20 s, si el termostato no tomó la temperatura, se la vuelve a enviar.
 2. **Cierran la puerta.** Empieza el SCAN. Basta con que alguien se mueva, o que prenda/apague un interruptor o cambie el termostato, para confirmar OCUPADO al instante.
 3. **Dejan la puerta abierta.** Tras el tiempo configurado (5 min por defecto) se apaga el aire y, un minuto después, las luces. **No importa si hay movimiento**: el salón queda así hasta que cierren la puerta.
 4. **Vuelven a cerrar la puerta con gente adentro.** Cuando el SCAN confirma que hay gente, se reanudan el aire y las luces. Abrir y cerrar la puerta otra vez no basta para que vuelva el aire.
@@ -80,8 +80,8 @@ stateDiagram-v2
 | **SCAN robusto** | Confirma la ocupación con cualquier movimiento nuevo **o** si el sensor sigue encendido al terminar. Funciona con sensores de tiempo corto y largo. |
 | **Manipulación = ocupado** (opcional) | Si durante el SCAN alguien prende o apaga un interruptor, o cambia el modo o la temperatura del termostato, pasa a OCUPADO sin esperar. Ignora los cambios que hacen las automatizaciones (MASTER OFF, sincronización del botón AC, el propio blueprint) y los reportes tardíos del termostato después de encenderlo. |
 | **Reentrada durante el apagado** | Si abren la puerta cuando el salón ya pasó a LIBRE y las luces todavía no se apagaron, se trata como una entrada y vuelve a encender. |
-| **Encendido en orden** | Primero el aire, un segundo después la temperatura (en un paso aparte del modo para que los termostatos Z-Wave sí la apliquen) y luego las luces. |
-| **Confirmación de temperatura** | Entre 20 y 40 s después de encender el aire, si el termostato no quedó en la temperatura de ocupación, se la reenvía una vez. Útil con mini split por IR y termostatos que restauran su valor anterior. |
+| **Encendido en paralelo** | El aire y las luces se encienden a la vez; la temperatura va un segundo después del modo, en un paso aparte para que los termostatos Z-Wave sí la apliquen. Un termostato lento o que no responde no retrasa las luces. |
+| **Confirmación de temperatura** | Entre 20 y 40 s después de que el blueprint encendió el aire, si el termostato no quedó en la temperatura de ocupación, se la reenvía una vez. Solo en automático y nunca sobre un aire que prendió una persona. Útil con mini split por IR y termostatos que restauran su valor anterior. |
 | **Cargas extra que solo se apagan** (opcional) | Luces o cargas que no se encienden con el salón (por ejemplo, las de ambiente), pero que se apagan junto con las luces. |
 | **Reanudación al cerrar** | Si la puerta apagó el aire y la cierran con gente, el aire vuelve con el primer movimiento. Si se fueron todos, no se enciende. |
 | **Respeta las luces del profesor** | Confirmar ocupación no vuelve a prender luces que el profesor apagó (por ejemplo, para proyectar). |
@@ -146,6 +146,15 @@ Al cerrar la puerta, el sensor puede seguir encendido por la persona que acaba d
 **Regla:** Tiempo de Scan > tiempo de encendido del sensor. Con el SCAN por defecto (420 s), ajusta el sensor (la perilla de tiempo del CS) a **4 minutos o menos**. Un sensor de 30 s a 2 min da los mejores resultados.
 
 ---
+
+## Novedades de la versión 2.4
+
+Cambios a partir del primer día de clases con la 2.3 (3 de noviembre de 2026, Colegio Karl C. Parrish, 8 salones). Las automatizaciones de la 2.3 siguen funcionando sin reconfigurar.
+
+| Cambio | Por qué |
+|---|---|
+| El reenvío de temperatura solo actúa en automático y solo sobre un aire que encendió el blueprint | En modo manual, cuando alguien prendía el aire a mano en 20,5–21 °C, el blueprint se lo cambiaba a 23 °C a los 20–40 s (3 casos un sábado). |
+| Aire y luces se encienden en paralelo | Con el aire primero, un termostato lento o que no respondía retrasaba las luces 12–18 s. |
 
 ## Novedades de la versión 2.3
 
